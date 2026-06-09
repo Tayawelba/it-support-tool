@@ -1,6 +1,6 @@
-```powershell
 # =============================================
 # IT SUPPORT TOOL - FUSION FINALE + DÉCHIFFREMENT DPAPI AUTO
+# Compatible PowerShell 5.1 / 7+
 # Niveau 5 Cybersécurité / HACH
 # =============================================
 
@@ -13,7 +13,7 @@ $CurrentUser  = $env:USERNAME
 $Date         = Get-Date -Format "yyyyMMdd_HHmmss"
 $ExportFolder = "C:\Support_Export\${MachineName}_${CurrentUser}_${Date}"
 
-# ── Vérification droits admin ──────────────────────────────────────────────────
+# ── Vérification droits admin ──────────────────────────────────────────────
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
     [Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
@@ -21,7 +21,7 @@ if (-not $isAdmin) {
     exit 1
 }
 
-# ── Création du dossier d'export ───────────────────────────────────────────────
+# ── Création du dossier d'export ───────────────────────────────────────────
 try {
     New-Item -Path $ExportFolder -ItemType Directory -Force -ErrorAction Stop | Out-Null
     Write-Host "Dossier créé : $ExportFolder" -ForegroundColor Green
@@ -171,31 +171,32 @@ function Export-BrowserPasswords {
 # ==============================================================================
 # MODULE 2.5 — DÉCHIFFREMENT AUTOMATIQUE (compatible PS5.1 / PS7+)
 # ==============================================================================
-
 function Decrypt-BrowserPasswords {
     Write-Host "`n=== [MODULE 2.5] DÉCHIFFREMENT AUTOMATIQUE CHROME/EDGE ===" -ForegroundColor Cyan
 
-    # Vérifier la présence de l'assembly System.Security (nécessaire pour ProtectedData)
+    # Chargement de l'assembly System.Security (nécessaire pour ProtectedData)
     try {
         Add-Type -AssemblyName System.Security -ErrorAction Stop
+        Write-Host "✓ Assembly System.Security chargé" -ForegroundColor Green
     } catch {
-        Write-Host "[ERREUR] Impossible de charger System.Security. Arrêt du module." -ForegroundColor Red
+        Write-Host "[ERREUR] Impossible de charger System.Security. Le déchiffrement est impossible." -ForegroundColor Red
         return
     }
 
-    # Vérifier si AesGcm est disponible (PS7+ uniquement)
-    $aesGcmAvailable = $true
+    # Détection de la présence de AesGcm (PowerShell 7+)
+    $aesGcmAvailable = $false
     try {
-        [System.Security.Cryptography.AesGcm]::new([byte[]]::new(32)) | Out-Null
+        $null = [System.Security.Cryptography.AesGcm]
+        $aesGcmAvailable = $true
+        Write-Host "✓ AES-GCM disponible (PowerShell 7+)" -ForegroundColor Green
     } catch {
-        $aesGcmAvailable = $false
-        Write-Host "[AVERTISSEMENT] AesGcm non disponible (PowerShell 5.1)." -ForegroundColor DarkYellow
-        Write-Host "Seuls les mots de passe au format DPAPI (anciens) pourront être déchiffrés." -ForegroundColor DarkYellow
-        Write-Host "Pour déchiffrer les mots de passe modernes (AES-GCM), installez PowerShell 7+ :" -ForegroundColor DarkYellow
-        Write-Host "https://aka.ms/powershell" -ForegroundColor Cyan
+        Write-Host "[AVERTISSEMENT] AES-GCM non disponible (PowerShell 5.1)." -ForegroundColor DarkYellow
+        Write-Host "             Seuls les mots de passe au format DPAPI (anciens) pourront être déchiffrés." -ForegroundColor DarkYellow
+        Write-Host "             Pour déchiffrer les mots de passe modernes, installez PowerShell 7 :" -ForegroundColor DarkYellow
+        Write-Host "             https://aka.ms/powershell" -ForegroundColor Cyan
     }
 
-    # Demander le navigateur
+    # Choix du navigateur
     Write-Host "1. Chrome`n2. Edge"
     $choice = Read-Host "Choix"
 
@@ -225,7 +226,7 @@ function Decrypt-BrowserPasswords {
             } catch { }
         }
         Write-Host "  $($i+1). $displayName  [$($p.Name)]" -ForegroundColor White
-        $list += [PSCustomObject]@{Index = $i; Folder = $p; Display = $displayName}
+        $list += [PSCustomObject]@{ Index = $i; Folder = $p; Display = $displayName }
     }
 
     $num = Read-Host "`nNuméro du profil"
@@ -243,7 +244,7 @@ function Decrypt-BrowserPasswords {
     $outputCsv = "$ExportFolder\${browser}_Passwords_Decrypted_${Date}.csv"
 
     try {
-        # Récupération de la Master Key (si AES-GCM)
+        # Récupération de la Master Key (si AES-GCM disponible)
         $masterKey = $null
         if ($aesGcmAvailable -and (Test-Path $localStatePath)) {
             $localState = Get-Content $localStatePath -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -266,6 +267,7 @@ function Decrypt-BrowserPasswords {
         if (-not $sqlite) {
             Write-Host "[ERREUR] sqlite3.exe non trouvé !" -ForegroundColor Red
             Write-Host "Téléchargez-le depuis https://sqlite.org/download.html" -ForegroundColor Yellow
+            Remove-Item $tempDb -Force -ErrorAction SilentlyContinue
             return
         }
 
@@ -339,6 +341,7 @@ function Decrypt-AesGcm($encryptedBytes, $masterKey) {
     $aes.Decrypt($iv, $cipher, $tag, $dec)
     return [System.Text.Encoding]::UTF8.GetString($dec)
 }
+
 
 # ==============================================================================
 # MODULE 3 — BLOCAGE PARTAGE CONNEXION (Version Prof complète)
@@ -728,4 +731,3 @@ do {
 } while ($choice.ToUpper() -ne "Q")
 
 Write-Host "`nTerminé. Tous les exports sont dans : $ExportFolder" -ForegroundColor Green
-```
